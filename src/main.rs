@@ -101,21 +101,21 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         }
 
         // Check recycle cost
-        let recycle_cost_start = Instant::now();
-        let recycle_cost = get_recycle_cost(&client, params.netuid).await?;
-        let recycle_cost_duration = recycle_cost_start.elapsed();
-        info!("⏱️ get_recycle_cost took {:?}", recycle_cost_duration);
-        info!("💸 Current recycle cost: {}", recycle_cost);
+        // let recycle_cost_start = Instant::now();
+        // let recycle_cost = get_recycle_cost(&client, params.netuid).await?;
+        // let recycle_cost_duration = recycle_cost_start.elapsed();
+        // info!("⏱️ get_recycle_cost took {:?}", recycle_cost_duration);
+        // info!("💸 Current recycle cost: {}", recycle_cost);
 
         // Skip if cost exceeds maximum allowed
-        if recycle_cost > params.max_cost {
-            warn!(
-                "💸 Recycle cost ({}) exceeds threshold ({}). Skipping registration attempt.",
-                recycle_cost, params.max_cost
-            );
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            continue;
-        }
+        // if recycle_cost > params.max_cost {
+        //     warn!(
+        //         "💸 Recycle cost ({}) exceeds threshold ({}). Skipping registration attempt.",
+        //         recycle_cost, params.max_cost
+        //     );
+        //     tokio::time::sleep(Duration::from_secs(1)).await;
+        //     continue;
+        // }
 
         // Sign and submit the transaction
         let sign_and_submit_start: Instant = Instant::now();
