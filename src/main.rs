@@ -2,7 +2,7 @@
 //! It allows users to register hotkeys using provided coldkeys and other parameters.
 
 use clap::Parser;
-use log::{error, info};
+use log::{error, info, warn};
 use scale_value::{Composite, Value};
 use serde::Deserialize;
 use sp_core::H256;
@@ -64,31 +64,40 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
     let hotkey: sr25519::Pair =
         sr25519::Pair::from_string(&params.hotkey, None).map_err(|_| "Invalid hotkey")?;
 
-    let signer = PairSigner::new(coldkey.clone());
+    let signer = Arc::new(PairSigner::new(coldkey.clone()));
 
+    let mut blocks = client.blocks().subscribe_finalized().await?;
+    let last_attempt = Arc::new(Mutex::new(Instant::now()));
     let loops = Arc::new(Mutex::new(0u64));
 
-    // Prepare transaction payload once for efficiency
-    let call_data = Composite::named([
+    // Cache the call_data for efficiency
+    let call_data = Arc::new(Composite::named([
         ("netuid", params.netuid.into()),
         ("hotkey", hotkey.public().0.to_vec().into()),
-    ]);
-    let payload = DefaultPayload::new("SubtensorModule", "burned_register", call_data);
+    ]));
 
-    // Main registration loop - attempt immediately without waiting for blocks
-    loop {
+    // Prepare transaction payload
+    let payload = Arc::new(DefaultPayload::new(
+        "SubtensorModule",
+        "burned_register",
+        call_data.as_ref().clone(),
+    ));
+
+    // Main registration loop
+    while let Some(block) = blocks.next().await {
+        let block = block?;
+        let block_number = block.header().number;
+
         // Increment and log loop count
         {
             let mut loops_guard = loops.lock().await;
             *loops_guard += 1;
-            if *loops_guard % 10 == 1 {
-                // Log every 10th attempt to reduce overhead
-                info!(
-                    "{} | {} | Attempting registration",
-                    *loops_guard,
-                    get_formatted_date_now()
-                );
-            }
+            info!(
+                "{} | {} | Attempting registration for block {}",
+                *loops_guard,
+                get_formatted_date_now(),
+                block_number
+            );
         }
 
         // Check recycle cost
@@ -108,48 +117,97 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         //     continue;
         // }
 
-        // Sign and submit the transaction directly without spawn
+        // Sign and submit the transaction
         let sign_and_submit_start: Instant = Instant::now();
-        let result = match client
-            .tx()
-            .sign_and_submit_then_watch_default(&payload, &signer)
-            .await
+        let client_clone: Arc<OnlineClient<SubstrateConfig>> = Arc::clone(&client);
+        let signer_clone: Arc<PairSigner<SubstrateConfig, sr25519::Pair>> = Arc::clone(&signer);
+        let paylod_clone = Arc::clone(&payload);
+        let result = match tokio::spawn(async move {
+            client_clone
+                .tx()
+                .sign_and_submit_then_watch(&*paylod_clone, &*signer_clone, Default::default())
+                .await
+        })
+        .await
         {
-            Ok(result) => result,
-            Err(e) => {
+            Ok(Ok(result)) => result,
+            Ok(Err(e)) => {
                 error!("Transaction submission failed: {:?}", e);
-                // Minimal delay before retry
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
+                continue; // Continue to next iteration
+            }
+            Err(e) => {
+                error!("Tokio spawn task failed: {:?}", e);
+                continue; // Continue to next iteration
             }
         };
 
         let sign_and_submit_duration = sign_and_submit_start.elapsed();
-        if sign_and_submit_duration > Duration::from_millis(200) {
-            info!("⏱️ sign_and_submit took {:?}", sign_and_submit_duration);
-        }
+        info!("⏱️ sign_and_submit took {:?}", sign_and_submit_duration);
 
         // Wait for transaction finalization
         let finalization_start = Instant::now();
         match result.wait_for_finalized_success().await {
             Ok(events) => {
                 let finalization_duration = finalization_start.elapsed();
+                info!(
+                    "⏱️ wait_for_finalized_success took {:?}",
+                    finalization_duration
+                );
                 let block_hash: H256 = events.extrinsic_hash();
                 info!(
-                    "🎯 Registration successful! Hash: {}, Finalization: {:?}",
-                    block_hash, finalization_duration
+                    "🎯 Registration successful at block {}. Events: {:?}",
+                    block_hash, events
                 );
                 break; // Exit the loop on successful registration
             }
             Err(e) => {
                 error!("Registration failed: {:?}", e);
-                // Minimal delay before retry
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                // Continue to next iteration
             }
         }
+
+        // Implement rate limiting
+        let mut last_attempt_guard = last_attempt.lock().await;
+        if last_attempt_guard.elapsed() < Duration::from_secs(1) {
+            tokio::time::sleep(Duration::from_secs(1) - last_attempt_guard.elapsed()).await;
+        }
+        *last_attempt_guard = Instant::now();
     }
 
     Ok(())
+}
+
+/// Retrieves the current recycle cost for a given network UID
+///
+/// # Arguments
+///
+/// * `client` - A reference to the blockchain client
+/// * `netuid` - The network UID to check
+///
+/// # Returns
+///
+/// A `Result` containing the recycle cost as a `u64` if successful, or an `Err` if retrieval fails
+async fn get_recycle_cost(
+    client: &OnlineClient<SubstrateConfig>,
+    netuid: u16,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let latest_block = client.blocks().at_latest().await?;
+    let burn_key = subxt::storage::dynamic(
+        "SubtensorModule",
+        "Burn",
+        vec![Value::primitive(scale_value::Primitive::U128(
+            netuid as u128,
+        ))],
+    );
+    let burn_cost: u64 = client
+        .storage()
+        .at(latest_block.hash())
+        .fetch(&burn_key)
+        .await?
+        .ok_or_else(|| "Burn value not found for the given netuid".to_string())?
+        .as_type::<u64>()?;
+
+    Ok(burn_cost)
 }
 
 // TODO: Return UID of the registered neuron
