@@ -67,7 +67,6 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
     let signer = Arc::new(PairSigner::new(coldkey.clone()));
 
     let mut blocks = client.blocks().subscribe_finalized().await?;
-    let last_attempt = Arc::new(Mutex::new(Instant::now()));
     let loops = Arc::new(Mutex::new(0u64));
 
     // Cache the call_data for efficiency
@@ -117,12 +116,15 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         //     continue;
         // }
 
-        // Sign and submit the transaction
+        // Sign and submit the transaction immediately for maximum speed
+        // subxt will automatically fetch the latest nonce from the chain
         let sign_and_submit_start: Instant = Instant::now();
         let client_clone: Arc<OnlineClient<SubstrateConfig>> = Arc::clone(&client);
         let signer_clone: Arc<PairSigner<SubstrateConfig, sr25519::Pair>> = Arc::clone(&signer);
         let paylod_clone = Arc::clone(&payload);
         let result = match tokio::spawn(async move {
+            // sign_and_submit_then_watch automatically queries the latest block state
+            // to get the current nonce, preventing conflicts
             client_clone
                 .tx()
                 .sign_and_submit_then_watch(&*paylod_clone, &*signer_clone, Default::default())
@@ -132,7 +134,17 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         {
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
-                error!("Transaction submission failed: {:?}", e);
+                let error_str = format!("{:?}", e);
+                // Check for nonce-related errors
+                if error_str.contains("TooManyConsumers")
+                    || error_str.contains("InvalidTransaction")
+                    || error_str.contains("Stale")
+                    || error_str.contains("nonce")
+                {
+                    warn!("Nonce-related error detected, will retry: {:?}", e);
+                } else {
+                    error!("Transaction submission failed: {:?}", e);
+                }
                 continue; // Continue to next iteration
             }
             Err(e) => {
@@ -158,20 +170,36 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
                     "🎯 Registration successful at block {}. Events: {:?}",
                     block_hash, events
                 );
-                break; // Exit the loop on successful registration
+                info!("✅ Registration completed! Continuing to attempt for next epoch opportunities...");
+                // Continue attempting instead of exiting - keeps bot active for next epoch
             }
             Err(e) => {
-                error!("Registration failed: {:?}", e);
+                let error_str = format!("{:?}", e);
+                // Check if the error indicates the hotkey is already registered
+                if error_str.contains("AlreadyRegistered")
+                    || error_str.contains("already registered")
+                    || error_str.contains("duplicate")
+                {
+                    warn!("Hotkey appears to be already registered: {:?}", e);
+                    // Check if we should exit or continue
+                    // For now, we'll continue in case it's a false positive
+                } else if error_str.contains("TooManyConsumers")
+                    || error_str.contains("InvalidTransaction")
+                    || error_str.contains("Stale")
+                    || error_str.contains("nonce")
+                {
+                    warn!(
+                        "Nonce-related error during finalization, will retry: {:?}",
+                        e
+                    );
+                } else {
+                    error!("Registration failed: {:?}", e);
+                }
                 // Continue to next iteration
             }
         }
 
-        // Implement rate limiting
-        let mut last_attempt_guard = last_attempt.lock().await;
-        if last_attempt_guard.elapsed() < Duration::from_secs(1) {
-            tokio::time::sleep(Duration::from_secs(1) - last_attempt_guard.elapsed()).await;
-        }
-        *last_attempt_guard = Instant::now();
+        // No rate limiting - maximum speed for competitive registration
     }
 
     Ok(())
@@ -187,6 +215,7 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
 /// # Returns
 ///
 /// A `Result` containing the recycle cost as a `u64` if successful, or an `Err` if retrieval fails
+#[allow(dead_code)]
 async fn get_recycle_cost(
     client: &OnlineClient<SubstrateConfig>,
     netuid: u16,
