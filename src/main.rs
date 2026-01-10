@@ -66,7 +66,9 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
 
     let signer = Arc::new(PairSigner::new(coldkey.clone()));
 
-    let mut blocks = client.blocks().subscribe_finalized().await?;
+    // Subscribe to best blocks instead of finalized blocks
+    // Finalized blocks are 2-3 blocks behind, causing "Transaction is outdated" errors
+    let mut blocks = client.blocks().subscribe_best().await?;
     let loops = Arc::new(Mutex::new(0u64));
 
     // Cache the call_data for efficiency
@@ -135,13 +137,18 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
             Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 let error_str = format!("{:?}", e);
-                // Check for nonce-related errors
+                // Check for nonce-related or timing errors (these are recoverable)
                 if error_str.contains("TooManyConsumers")
                     || error_str.contains("InvalidTransaction")
                     || error_str.contains("Stale")
                     || error_str.contains("nonce")
+                    || error_str.contains("outdated")
+                    || error_str.contains("Transaction is outdated")
                 {
-                    warn!("Nonce-related error detected, will retry: {:?}", e);
+                    warn!(
+                        "Recoverable error detected, will retry on next block: {:?}",
+                        e
+                    );
                 } else {
                     error!("Transaction submission failed: {:?}", e);
                 }
