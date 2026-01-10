@@ -156,50 +156,54 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         let sign_and_submit_duration = sign_and_submit_start.elapsed();
         info!("⏱️ sign_and_submit took {:?}", sign_and_submit_duration);
 
-        // Wait for transaction finalization
-        let finalization_start = Instant::now();
-        match result.wait_for_finalized_success().await {
-            Ok(events) => {
-                let finalization_duration = finalization_start.elapsed();
-                info!(
-                    "⏱️ wait_for_finalized_success took {:?}",
-                    finalization_duration
-                );
-                let block_hash: H256 = events.extrinsic_hash();
-                info!(
-                    "🎯 Registration successful at block {}. Events: {:?}",
-                    block_hash, events
-                );
-                info!("✅ Registration completed! Continuing to attempt for next epoch opportunities...");
-                // Continue attempting instead of exiting - keeps bot active for next epoch
-            }
-            Err(e) => {
-                let error_str = format!("{:?}", e);
-                // Check if the error indicates the hotkey is already registered
-                if error_str.contains("AlreadyRegistered")
-                    || error_str.contains("already registered")
-                    || error_str.contains("duplicate")
-                {
-                    warn!("Hotkey appears to be already registered: {:?}", e);
-                    // Check if we should exit or continue
-                    // For now, we'll continue in case it's a false positive
-                } else if error_str.contains("TooManyConsumers")
-                    || error_str.contains("InvalidTransaction")
-                    || error_str.contains("Stale")
-                    || error_str.contains("nonce")
-                {
-                    warn!(
-                        "Nonce-related error during finalization, will retry: {:?}",
-                        e
+        // Spawn background task to monitor finalization (non-blocking)
+        // This allows the main loop to continue immediately for correct timing
+        let block_num = block_number;
+        tokio::spawn(async move {
+            let finalization_start = Instant::now();
+            match result.wait_for_finalized_success().await {
+                Ok(events) => {
+                    let finalization_duration = finalization_start.elapsed();
+                    info!(
+                        "⏱️ [Block {}] wait_for_finalized_success took {:?}",
+                        block_num, finalization_duration
                     );
-                } else {
-                    error!("Registration failed: {:?}", e);
+                    let block_hash: H256 = events.extrinsic_hash();
+                    info!(
+                        "🎯 [Block {}] Registration successful! Extrinsic hash: {}",
+                        block_num, block_hash
+                    );
+                    info!("✅ Registration completed! Bot continues attempting for next epoch opportunities...");
                 }
-                // Continue to next iteration
+                Err(e) => {
+                    let error_str = format!("{:?}", e);
+                    // Check if the error indicates the hotkey is already registered
+                    if error_str.contains("AlreadyRegistered")
+                        || error_str.contains("already registered")
+                        || error_str.contains("duplicate")
+                    {
+                        warn!(
+                            "[Block {}] Hotkey appears to be already registered: {:?}",
+                            block_num, e
+                        );
+                    } else if error_str.contains("TooManyConsumers")
+                        || error_str.contains("InvalidTransaction")
+                        || error_str.contains("Stale")
+                        || error_str.contains("nonce")
+                    {
+                        warn!(
+                            "[Block {}] Nonce-related error during finalization: {:?}",
+                            block_num, e
+                        );
+                    } else {
+                        error!("[Block {}] Registration failed: {:?}", block_num, e);
+                    }
+                }
             }
-        }
+        });
 
-        // No rate limiting - maximum speed for competitive registration
+        // Continue immediately to next block - no blocking wait
+        // This ensures correct timing for each epoch opportunity
     }
 
     Ok(())
