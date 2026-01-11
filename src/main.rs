@@ -5,10 +5,7 @@ use clap::Parser;
 use log::{error, info, warn};
 use scale_value::{Composite, Value};
 use serde::Deserialize;
-use sp_core::H256;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
-use subxt::config::DefaultExtrinsicParamsBuilder;
 use subxt::ext::sp_core::{sr25519, Pair};
 use subxt::tx::DefaultPayload;
 use subxt::{tx::PairSigner, OnlineClient, SubstrateConfig};
@@ -64,7 +61,7 @@ fn get_formatted_date_now() -> String {
 // TODO: Parse event and decode Registered event
 async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize client connection to the blockchain
-    let client = Arc::new(OnlineClient::<SubstrateConfig>::from_url(&params.chain_endpoint).await?);
+    let client = OnlineClient::<SubstrateConfig>::from_url(&params.chain_endpoint).await?;
 
     // Parse coldkey and hotkey from provided strings
     let coldkey: sr25519::Pair =
@@ -72,7 +69,7 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
     let hotkey: sr25519::Pair =
         sr25519::Pair::from_string(&params.hotkey, None).map_err(|_| "Invalid hotkey")?;
 
-    let signer = Arc::new(PairSigner::new(coldkey.clone()));
+    let signer = PairSigner::new(coldkey.clone());
 
     // Track the last block we submitted on to avoid duplicate submissions
     let mut last_submitted_block: u32 = 0;
@@ -140,20 +137,17 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
 
         let payload = DefaultPayload::new("SubtensorModule", "burned_register", call_data);
 
-        // Sign and submit the transaction using the current latest block
+        // Sign and submit the transaction
+        // Use sign_and_submit (fire-and-forget) with Default params
+        // Default params automatically fetch the correct finalized block checkpoint
         let sign_and_submit_start: Instant = Instant::now();
 
-        // Use a long mortality period (256 blocks = ~51 minutes) to avoid outdated errors
-        let tx_params = DefaultExtrinsicParamsBuilder::new()
-            .mortal(latest_block.header(), 256)
-            .build();
-
-        let result = match client
+        let tx_hash = match client
             .tx()
-            .sign_and_submit_then_watch(&payload, &*signer, tx_params)
+            .sign_and_submit_default(&payload, &*signer)
             .await
         {
-            Ok(result) => result,
+            Ok(hash) => hash,
             Err(e) => {
                 let error_str = format!("{:?}", e);
                 // Check for recoverable errors
@@ -176,53 +170,15 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         };
 
         let sign_and_submit_duration = sign_and_submit_start.elapsed();
-        info!("⏱️ sign_and_submit took {:?}", sign_and_submit_duration);
-
-        // Spawn background task to monitor finalization (non-blocking)
-        // This allows the main loop to continue immediately for correct timing
-        let block_num = block_number;
-        tokio::spawn(async move {
-            let finalization_start = Instant::now();
-            match result.wait_for_finalized_success().await {
-                Ok(events) => {
-                    let finalization_duration = finalization_start.elapsed();
-                    info!(
-                        "⏱️ [Block {}] wait_for_finalized_success took {:?}",
-                        block_num, finalization_duration
-                    );
-                    let block_hash: H256 = events.extrinsic_hash();
-                    info!(
-                        "🎯 [Block {}] Registration successful! Extrinsic hash: {}",
-                        block_num, block_hash
-                    );
-                    info!("✅ Registration completed! Bot continues attempting for next epoch opportunities...");
-                }
-                Err(e) => {
-                    let error_str = format!("{:?}", e);
-                    if error_str.contains("AlreadyRegistered")
-                        || error_str.contains("already registered")
-                        || error_str.contains("duplicate")
-                    {
-                        warn!(
-                            "[Block {}] Hotkey appears to be already registered: {:?}",
-                            block_num, e
-                        );
-                    } else if error_str.contains("TooManyConsumers")
-                        || error_str.contains("InvalidTransaction")
-                        || error_str.contains("Stale")
-                        || error_str.contains("nonce")
-                        || error_str.contains("outdated")
-                    {
-                        warn!(
-                            "[Block {}] Recoverable error during finalization: {:?}",
-                            block_num, e
-                        );
-                    } else {
-                        error!("[Block {}] Registration failed: {:?}", block_num, e);
-                    }
-                }
-            }
-        });
+        info!(
+            "⏱️ sign_and_submit took {:?}, tx_hash: {}",
+            sign_and_submit_duration, tx_hash
+        );
+        info!(
+            "🎯 [Block {}] Transaction submitted successfully! Hash: {}",
+            block_number, tx_hash
+        );
+        info!("✅ Submission completed! Bot continues for next epoch opportunities...");
 
         // Continue immediately to poll for next block
     }
