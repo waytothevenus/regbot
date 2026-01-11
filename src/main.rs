@@ -12,7 +12,6 @@ use subxt::config::DefaultExtrinsicParamsBuilder;
 use subxt::ext::sp_core::{sr25519, Pair};
 use subxt::tx::DefaultPayload;
 use subxt::{tx::PairSigner, OnlineClient, SubstrateConfig};
-use tokio::sync::Mutex;
 
 /// Struct to hold registration parameters, can be parsed from command line or config file
 #[derive(Parser, Deserialize, Debug)]
@@ -75,34 +74,44 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
 
     let signer = Arc::new(PairSigner::new(coldkey.clone()));
 
-    // Subscribe to best blocks instead of finalized blocks
-    // Finalized blocks are 2-3 blocks behind, causing "Transaction is outdated" errors
-    let mut blocks = client.blocks().subscribe_best().await?;
-    let loops = Arc::new(Mutex::new(0u64));
+    // Track the last block we submitted on to avoid duplicate submissions
+    let mut last_submitted_block: u32 = 0;
+    let mut loop_count: u64 = 0;
 
-    // Cache the call_data for efficiency
-    let call_data = Arc::new(Composite::named([
-        ("netuid", params.netuid.into()),
-        ("hotkey", hotkey.public().0.to_vec().into()),
-    ]));
+    info!(
+        "🚀 Starting registration bot for slot {} (will submit on blocks where block_number % 3 == {})",
+        params.slot, params.slot
+    );
 
-    // Prepare transaction payload
-    let payload = Arc::new(DefaultPayload::new(
-        "SubtensorModule",
-        "burned_register",
-        call_data.as_ref().clone(),
-    ));
+    // Main registration loop - poll for latest block continuously
+    // This approach is more reliable than subscriptions for time-sensitive operations
+    loop {
+        // Small delay to prevent overwhelming the RPC
+        tokio::time::sleep(Duration::from_millis(500)).await;
 
-    // Main registration loop
-    while let Some(block) = blocks.next().await {
-        let block = block?;
-        let block_number = block.header().number;
+        // Fetch the absolute latest block
+        let latest_block = match client.blocks().at_latest().await {
+            Ok(b) => b,
+            Err(e) => {
+                warn!("Failed to fetch latest block: {:?}", e);
+                continue;
+            }
+        };
+
+        let block_number = latest_block.header().number;
+        let block_hash = latest_block.hash();
+
+        // Skip if we already submitted for this block
+        if block_number <= last_submitted_block {
+            continue;
+        }
 
         // Check if this block matches our designated slot
         // Each instance targets blocks where block_number % 3 == slot
-        // This ensures 3 instances submit on consecutive blocks, not the same block
         let block_slot = block_number % 3;
         if block_slot != params.slot {
+            // Update last seen block but don't submit
+            last_submitted_block = block_number;
             info!(
                 "⏭️ Skipping block {} (slot {}), waiting for slot {}",
                 block_number, block_slot, params.slot
@@ -110,68 +119,44 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
             continue;
         }
 
-        // Increment and log loop count
-        {
-            let mut loops_guard = loops.lock().await;
-            *loops_guard += 1;
-            info!(
-                "{} | {} | 🎯 Slot {} - Attempting registration for block {}",
-                *loops_guard,
-                get_formatted_date_now(),
-                params.slot,
-                block_number
-            );
-        }
+        // This is our slot! Submit immediately
+        last_submitted_block = block_number;
+        loop_count += 1;
 
-        // Check recycle cost
-        // let recycle_cost_start = Instant::now();
-        // let recycle_cost = get_recycle_cost(&client, params.netuid).await?;
-        // let recycle_cost_duration = recycle_cost_start.elapsed();
-        // info!("⏱️ get_recycle_cost took {:?}", recycle_cost_duration);
-        // info!("💸 Current recycle cost: {}", recycle_cost);
+        info!(
+            "{} | {} | 🎯 Slot {} - Attempting registration for block {} (hash: {})",
+            loop_count,
+            get_formatted_date_now(),
+            params.slot,
+            block_number,
+            block_hash
+        );
 
-        // Skip if cost exceeds maximum allowed
-        // if recycle_cost > params.max_cost {
-        //     warn!(
-        //         "💸 Recycle cost ({}) exceeds threshold ({}). Skipping registration attempt.",
-        //         recycle_cost, params.max_cost
-        //     );
-        //     tokio::time::sleep(Duration::from_secs(1)).await;
-        //     continue;
-        // }
+        // Prepare transaction payload fresh for each submission
+        let call_data = Composite::named([
+            ("netuid", params.netuid.into()),
+            ("hotkey", hotkey.public().0.to_vec().into()),
+        ]);
 
-        // Sign and submit the transaction
-        // Fetch the latest block for mortality to avoid "Transaction is outdated" errors
+        let payload = DefaultPayload::new("SubtensorModule", "burned_register", call_data);
+
+        // Sign and submit the transaction using the current latest block
         let sign_and_submit_start: Instant = Instant::now();
-        let client_clone: Arc<OnlineClient<SubstrateConfig>> = Arc::clone(&client);
-        let signer_clone: Arc<PairSigner<SubstrateConfig, sr25519::Pair>> = Arc::clone(&signer);
-        let paylod_clone = Arc::clone(&payload);
-        let result = match tokio::spawn(async move {
-            // Fetch the absolute latest block for signing to avoid outdated transaction
-            let latest_block = match client_clone.blocks().at_latest().await {
-                Ok(b) => b,
-                Err(e) => {
-                    return Err(subxt::Error::Other(format!(
-                        "Failed to get latest block: {:?}",
-                        e
-                    )));
-                }
-            };
-            // Use the freshest block with a long mortality period (64 blocks = ~12 minutes)
-            let tx_params = DefaultExtrinsicParamsBuilder::new()
-                .mortal(latest_block.header(), 64)
-                .build();
-            client_clone
-                .tx()
-                .sign_and_submit_then_watch(&*paylod_clone, &*signer_clone, tx_params)
-                .await
-        })
-        .await
+
+        // Use a long mortality period (256 blocks = ~51 minutes) to avoid outdated errors
+        let tx_params = DefaultExtrinsicParamsBuilder::new()
+            .mortal(latest_block.header(), 256)
+            .build();
+
+        let result = match client
+            .tx()
+            .sign_and_submit_then_watch(&payload, &*signer, tx_params)
+            .await
         {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
+            Ok(result) => result,
+            Err(e) => {
                 let error_str = format!("{:?}", e);
-                // Check for nonce-related or timing errors (these are recoverable)
+                // Check for recoverable errors
                 if error_str.contains("TooManyConsumers")
                     || error_str.contains("InvalidTransaction")
                     || error_str.contains("Stale")
@@ -180,17 +165,13 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
                     || error_str.contains("Transaction is outdated")
                 {
                     warn!(
-                        "Recoverable error detected, will retry on next block: {:?}",
+                        "Recoverable error detected, will retry on next matching slot: {:?}",
                         e
                     );
                 } else {
                     error!("Transaction submission failed: {:?}", e);
                 }
-                continue; // Continue to next iteration
-            }
-            Err(e) => {
-                error!("Tokio spawn task failed: {:?}", e);
-                continue; // Continue to next iteration
+                continue;
             }
         };
 
@@ -218,7 +199,6 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
                 }
                 Err(e) => {
                     let error_str = format!("{:?}", e);
-                    // Check if the error indicates the hotkey is already registered
                     if error_str.contains("AlreadyRegistered")
                         || error_str.contains("already registered")
                         || error_str.contains("duplicate")
@@ -231,9 +211,10 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
                         || error_str.contains("InvalidTransaction")
                         || error_str.contains("Stale")
                         || error_str.contains("nonce")
+                        || error_str.contains("outdated")
                     {
                         warn!(
-                            "[Block {}] Nonce-related error during finalization: {:?}",
+                            "[Block {}] Recoverable error during finalization: {:?}",
                             block_num, e
                         );
                     } else {
@@ -243,11 +224,8 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
             }
         });
 
-        // Continue immediately to next block - no blocking wait
-        // This ensures correct timing for each epoch opportunity
+        // Continue immediately to poll for next block
     }
-
-    Ok(())
 }
 
 /// Retrieves the current recycle cost for a given network UID
