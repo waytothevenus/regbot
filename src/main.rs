@@ -142,11 +142,7 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         // Default params automatically fetch the correct finalized block checkpoint
         let sign_and_submit_start: Instant = Instant::now();
 
-        let tx_hash = match client
-            .tx()
-            .sign_and_submit_default(&payload, &*signer)
-            .await
-        {
+        let tx_hash = match client.tx().sign_and_submit_default(&payload, &signer).await {
             Ok(hash) => hash,
             Err(e) => {
                 let error_str = format!("{:?}", e);
