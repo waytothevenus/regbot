@@ -32,6 +32,14 @@ struct RegistrationParams {
 
     #[clap(long, default_value = "wss://entrypoint-finney.opentensor.ai:443")]
     chain_endpoint: String,
+
+    /// Slot number (0, 1, or 2) to determine which block within the 3-block registration window to target.
+    /// - Slot 0: submits on blocks where block_number % 3 == 0
+    /// - Slot 1: submits on blocks where block_number % 3 == 1  
+    /// - Slot 2: submits on blocks where block_number % 3 == 2
+    /// Run 3 instances with --slot 0, --slot 1, --slot 2 to register 3 miners per epoch.
+    #[clap(long, default_value = "0")]
+    slot: u32,
 }
 
 /// Returns the current date and time in Eastern Time Zone
@@ -90,14 +98,27 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         let block = block?;
         let block_number = block.header().number;
 
+        // Check if this block matches our designated slot
+        // Each instance targets blocks where block_number % 3 == slot
+        // This ensures 3 instances submit on consecutive blocks, not the same block
+        let block_slot = block_number % 3;
+        if block_slot != params.slot {
+            info!(
+                "⏭️ Skipping block {} (slot {}), waiting for slot {}",
+                block_number, block_slot, params.slot
+            );
+            continue;
+        }
+
         // Increment and log loop count
         {
             let mut loops_guard = loops.lock().await;
             *loops_guard += 1;
             info!(
-                "{} | {} | Attempting registration for block {}",
+                "{} | {} | 🎯 Slot {} - Attempting registration for block {}",
                 *loops_guard,
                 get_formatted_date_now(),
+                params.slot,
                 block_number
             );
         }
@@ -119,19 +140,26 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         //     continue;
         // }
 
-        // Sign and submit the transaction with current block as checkpoint
-        // This prevents "Transaction is outdated" errors by using fresh mortality
+        // Sign and submit the transaction
+        // Fetch the latest block for mortality to avoid "Transaction is outdated" errors
         let sign_and_submit_start: Instant = Instant::now();
         let client_clone: Arc<OnlineClient<SubstrateConfig>> = Arc::clone(&client);
         let signer_clone: Arc<PairSigner<SubstrateConfig, sr25519::Pair>> = Arc::clone(&signer);
         let paylod_clone = Arc::clone(&payload);
-        let block_hash = block.hash();
-        let block_num_for_tx = block_number;
         let result = match tokio::spawn(async move {
-            // Use current block as the checkpoint for transaction mortality
-            // This ensures the transaction is valid for the current block
+            // Fetch the absolute latest block for signing to avoid outdated transaction
+            let latest_block = match client_clone.blocks().at_latest().await {
+                Ok(b) => b,
+                Err(e) => {
+                    return Err(subxt::Error::Other(format!(
+                        "Failed to get latest block: {:?}",
+                        e
+                    )));
+                }
+            };
+            // Use the freshest block with a long mortality period (64 blocks = ~12 minutes)
             let tx_params = DefaultExtrinsicParamsBuilder::new()
-                .mortal_unchecked(block_num_for_tx.into(), block_hash, 8) // 8 blocks mortality period
+                .mortal(latest_block.header(), 64)
                 .build();
             client_clone
                 .tx()
