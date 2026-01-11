@@ -8,6 +8,7 @@ use serde::Deserialize;
 use sp_core::H256;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use subxt::config::DefaultExtrinsicParamsBuilder;
 use subxt::ext::sp_core::{sr25519, Pair};
 use subxt::tx::DefaultPayload;
 use subxt::{tx::PairSigner, OnlineClient, SubstrateConfig};
@@ -118,18 +119,23 @@ async fn register_hotkey(params: &RegistrationParams) -> Result<(), Box<dyn std:
         //     continue;
         // }
 
-        // Sign and submit the transaction immediately for maximum speed
-        // subxt will automatically fetch the latest nonce from the chain
+        // Sign and submit the transaction with current block as checkpoint
+        // This prevents "Transaction is outdated" errors by using fresh mortality
         let sign_and_submit_start: Instant = Instant::now();
         let client_clone: Arc<OnlineClient<SubstrateConfig>> = Arc::clone(&client);
         let signer_clone: Arc<PairSigner<SubstrateConfig, sr25519::Pair>> = Arc::clone(&signer);
         let paylod_clone = Arc::clone(&payload);
+        let block_hash = block.hash();
+        let block_num_for_tx = block_number;
         let result = match tokio::spawn(async move {
-            // sign_and_submit_then_watch automatically queries the latest block state
-            // to get the current nonce, preventing conflicts
+            // Use current block as the checkpoint for transaction mortality
+            // This ensures the transaction is valid for the current block
+            let tx_params = DefaultExtrinsicParamsBuilder::new()
+                .mortal_unchecked(block_num_for_tx.into(), block_hash, 8) // 8 blocks mortality period
+                .build();
             client_clone
                 .tx()
-                .sign_and_submit_then_watch(&*paylod_clone, &*signer_clone, Default::default())
+                .sign_and_submit_then_watch(&*paylod_clone, &*signer_clone, tx_params)
                 .await
         })
         .await
